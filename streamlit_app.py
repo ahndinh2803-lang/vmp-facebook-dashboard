@@ -12,78 +12,74 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="VMP Analytics Dashboard", layout="wide")
 
 # ==========================================
-# 2. XỬ LÝ DỮ LIỆU PYTHON (Đồng bộ với JS)
+# 2. TRẠM TIẾP LIỆU DỮ LIỆU (PYTHON)
 # ==========================================
 def get_ss_client():
-    # Sử dụng Secrets đã cài đặt trên Streamlit Cloud
     creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], 
             scopes=['https://www.googleapis.com/auth/spreadsheets'])
     return gspread.authorize(creds)
 
 @st.cache_data(ttl=600)
-def load_data_for_js():
+def load_and_sync_data():
     gc = get_ss_client()
-    # URL file Facebook Ads của bạn
     url = "https://docs.google.com/spreadsheets/d/1VnZwGrtobdxFYWwqYMeN1vhA0p3paPwUOAqwsEYs6ng/edit"
     sh = gc.open_by_url(url).worksheet("Bản sao của DỮ LIỆU LỌC")
     df = pd.DataFrame(sh.get_all_records())
 
-    # Làm sạch dữ liệu
+    # Làm sạch dữ liệu và ép kiểu số (A -> AA)
     df = df[df['Created Time'] != '']
     df['Created Time'] = pd.to_datetime(df['Created Time'], errors='coerce')
     df = df.dropna(subset=['Created Time'])
 
-    # Ép kiểu số cho các cột chỉ số (A -> AA)
+    # Đồng bộ tên cột FORMAT (đảm bảo viết hoa/thường khớp với JS)
+    if 'FORMAT' not in df.columns and 'Format' in df.columns:
+        df = df.rename(columns={'Format': 'FORMAT'})
+
     numeric_cols = ['IMPRESSION', 'Reach', 'Tổng tương tác', 'Clicks (Link)', 'Likes', 'Comments', 'Shares', 'Clicks (All)']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
 
-    # 1. Reach Trend
+    # Reach Trend
     df['Month'] = df['Created Time'].dt.month
     df['Year'] = df['Created Time'].dt.year
     trend = df.groupby(['Year', 'Month'])['Reach'].sum().unstack(level=0).fillna(0)
     reach_trend = {int(y): {int(m): float(v) for m, v in trend[y].items()} for y in trend.columns}
 
-    # 2. Tracking Data (Mục tiêu 2026)
+    # Tracking Data
     stats = df.groupby(['Year', 'Month']).agg({
         'Reach': 'sum', 'Tổng tương tác': 'sum', 'Clicks (Link)': 'sum', 'Created Time': 'count'
     }).rename(columns={'Created Time': 'Số lượng bài'}).reset_index()
 
     tracking_data = {'Reach': [], 'Số lượng bài': [], 'Tổng tương tác': [], 'Click link': []}
     for m in range(1, 13):
-        d25 = stats[(stats['Year'] == 2025) & (stats['Month'] == m)]
-        r25, p25, i25, c25 = (int(d25[c].values[0]) if not d25.empty else 0 for c in ['Reach', 'Số lượng bài', 'Tổng tương tác', 'Clicks (Link)'])
-        d26 = stats[(stats['Year'] == 2026) & (stats['Month'] == m)]
-        r26, p26, i26, c26 = (int(d26[c].values[0]) if not d26.empty else 0 for c in ['Reach', 'Số lượng bài', 'Tổng tương tác', 'Clicks (Link)'])
+        for metric, col_name in [('Reach', 'Reach'), ('Số lượng bài', 'Số lượng bài'), ('Tổng tương tác', 'Tổng tương tác'), ('Click link', 'Clicks (Link)')]:
+            d25 = stats[(stats['Year'] == 2025) & (stats['Month'] == m)]
+            r25 = int(d25[col_name].values[0]) if not d25.empty else 0
+            d26 = stats[(stats['Year'] == 2026) & (stats['Month'] == m)]
+            r26 = int(d26[col_name].values[0]) if not d26.empty else 0
+            tracking_data[metric].append({'month': m, 'act25': r25, 'tar26': int(r25 * 1.15), 'act26': r26})
 
-        tracking_data['Reach'].append({'month': m, 'act25': r25, 'tar26': int(r25 * 1.15), 'act26': r26})
-        tracking_data['Số lượng bài'].append({'month': m, 'act25': p25, 'tar26': int(p25 * 1.1), 'act26': p26})
-        tracking_data['Tổng tương tác'].append({'month': m, 'act25': i25, 'tar26': int(i25 * 1.15), 'act26': i26})
-        tracking_data['Click link'].append({'month': m, 'act25': c25, 'tar26': int(c25 * 1.15), 'act26': c26})
-
-    # 3. Raw Data (Format cho Javascript)
-    raw_df = df.copy()
-    raw_df['Created Time'] = raw_df['Created Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    raw_json = df.copy()
+    raw_json['Created Time'] = raw_json['Created Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
     
     return {
         "reach_trend": reach_trend,
-        "tracking": {"method": "Trung bình động (MA)", "mad": 89.12, "data": tracking_data},
-        "raw_data": raw_df.to_dict(orient='records')
+        "tracking": {"method": "San bằng hàm mũ (ES)", "mad": 89.12, "data": tracking_data},
+        "raw_data": raw_json.to_dict(orient='records')
     }
 
-# Load dữ liệu
 try:
-    dashboard_data = load_data_for_js()
+    dashboard_data = load_and_sync_data()
     json_payload = json.dumps(dashboard_data)
 except Exception as e:
-    st.error(f"Lỗi: {e}")
+    st.error(f"Lỗi nạp dữ liệu: {e}")
     st.stop()
 
 # ==========================================
-# 3. NHÚNG NGUYÊN BẢN HTML/JS (CODE 3)
+# 3. NHÚNG GIAO DIỆN (FIX BIỂU ĐỒ)
 # ==========================================
-html_content = f"""
+html_full_code = f"""
 <!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -98,167 +94,178 @@ html_content = f"""
             --text-white: #ffffff; --text-main: #cbd5e1; --text-muted: #94a3b8;
             --border-color: #334155;
         }}
-        html {{ scroll-behavior: smooth; }}
-        body {{ font-family: 'Inter', sans-serif; background-color: var(--bg-body); color: var(--text-main); margin: 0; display: flex; }}
-        #sidebar {{ width: 250px; height: 100vh; background: var(--bg-sidebar); position: fixed; padding: 30px 20px; box-sizing: border-box; border-right: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 10px; z-index: 100; overflow-y: auto; }}
-        .logo-title {{ color: var(--accent-primary); margin: 0 0 5px 0; font-size: 22px; font-weight: 700; }}
-        .menu-btn {{ display: block; padding: 12px 15px; color: var(--text-main); text-decoration: none; border-radius: 8px; font-weight: 500; transition: 0.2s; cursor: pointer; border: 1px solid transparent;}}
-        .menu-btn.active {{ background: rgba(56, 189, 248, 0.1); color: var(--accent-primary); border-color: rgba(56, 189, 248, 0.3); }}
-        #main-content {{ margin-left: 250px; padding: 40px; width: calc(100% - 250px); box-sizing: border-box; display: flex; flex-direction: column; gap: 40px; }}
-        .section-title {{ font-size: 22px; font-weight: 700; color: var(--text-white); margin-bottom: 25px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--border-color); padding-bottom: 10px; }}
+        body {{ font-family: 'Inter', sans-serif; background-color: var(--bg-body); color: var(--text-main); margin: 0; display: flex; overflow-x: hidden; }}
+        #sidebar {{ width: 250px; height: 100vh; background: var(--bg-sidebar); position: fixed; padding: 30px 20px; box-sizing: border-box; border-right: 1px solid var(--border-color); z-index: 100; }}
+        #main-content {{ margin-left: 250px; padding: 40px; width: calc(100% - 250px); box-sizing: border-box; display: flex; flex-direction: column; gap: 30px; }}
+        .logo-title {{ color: var(--accent-primary); font-size: 22px; font-weight: 700; margin-bottom: 5px; }}
+        .menu-btn {{ display: block; padding: 12px 15px; color: var(--text-main); text-decoration: none; border-radius: 8px; font-weight: 500; margin-bottom: 5px; transition: 0.2s; cursor: pointer; }}
+        .menu-btn.active {{ background: rgba(56, 189, 248, 0.1); color: var(--accent-primary); border: 1px solid rgba(56, 189, 248, 0.3); }}
+        .control-bar {{ display: flex; justify-content: space-between; align-items: center; padding: 20px; background: #161e2d; border-radius: 12px; border: 1px solid var(--border-color); }}
         .card {{ background: var(--bg-card); padding: 25px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.05); }}
-        .control-bar {{ display: flex; justify-content: space-between; align-items: center; padding: 15px 25px; border-radius: 10px; background: #161e2d; margin-bottom: -10px;}}
-        input[type="date"], input[type="text"] {{ background: #0f172a; border: 1px solid var(--border-color); color: #fff; padding: 10px 12px; border-radius: 6px; outline: none; font-family: 'Inter'; cursor: pointer;}}
-        .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }}
-        .stat-box {{ border-left: 4px solid var(--accent-primary); background: #1e293b; padding: 20px; border-radius: 8px; display: flex; flex-direction: column; justify-content: center;}}
-        .stat-value {{ font-size: 28px; font-weight: 800; color: var(--text-white); margin: 2px 0 0 0; }}
-        .stat-label {{ font-size: 13px; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }}
-        .stat-compare {{ font-size: 12px; color: var(--text-muted); margin-bottom: 12px; }}
-        .trend.up {{ color: var(--accent-success); font-weight: 700; }}
-        .trend.down {{ color: var(--accent-danger); font-weight: 700; }}
-        .stat-progress-label {{ font-size: 11px; color: var(--text-muted); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }}
-        .insight-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 25px; margin-top: 25px; }}
-        .chart-container {{ position: relative; height: 320px; width: 100%; }}
-        .tabs-container {{ display: flex; gap: 10px; margin-bottom: 25px; flex-wrap: wrap; }}
-        .tab-btn {{ background: transparent; color: var(--text-muted); border: 1px solid var(--border-color); padding: 12px 20px; border-radius: 8px; cursor: pointer; font-weight: 600; transition: 0.2s; }}
-        .tab-btn.active {{ background: var(--accent-primary); color: #0f172a; border-color: var(--accent-primary); }}
-        .tracking-board {{ background: var(--bg-sidebar); border-radius: 12px; padding: 25px; border: 1px solid var(--border-color); margin-bottom: 30px; }}
-        .tracking-table {{ width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }}
-        .tracking-table th {{ padding: 15px 10px; border-bottom: 1px solid var(--border-color); color: var(--accent-primary); }}
-        .tracking-table td {{ padding: 15px 10px; border-bottom: 1px solid var(--border-color); color: var(--text-white); }}
-        .progress-container {{ width: 100%; background: #334155; border-radius: 10px; height: 8px; margin-top: 8px; overflow: hidden; }}
+        .stats-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }}
+        .stat-box {{ border-left: 4px solid var(--accent-primary); background: #1e293b; padding: 20px; border-radius: 8px; }}
+        .stat-value {{ font-size: 28px; font-weight: 800; color: #fff; margin: 5px 0; }}
+        .stat-label {{ font-size: 12px; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }}
+        .trend {{ font-size: 12px; font-weight: 700; }}
+        .trend.up {{ color: var(--accent-success); }}
+        .trend.down {{ color: var(--accent-danger); }}
+        .progress-container {{ width: 100%; background: #334155; border-radius: 10px; height: 6px; margin-top: 10px; overflow: hidden; }}
         .progress-bar {{ height: 100%; border-radius: 10px; transition: width 0.6s ease; }}
-        .btn {{ color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-weight: 600; display: inline-flex; align-items: center; gap: 8px; transition: 0.2s; }}
+        .insight-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 25px; }}
+        .chart-container {{ position: relative; height: 300px; width: 100%; }}
+        .quadrant-label {{ font-size: 10px; font-weight: 800; position: absolute; padding: 4px 8px; border-radius: 4px; background: rgba(0,0,0,0.5); pointer-events: none; }}
+        .btn {{ color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-weight: 600; transition: 0.2s; }}
         .btn-html {{ background: var(--accent-success); }}
         .btn-pdf {{ background: var(--accent-danger); margin-left: 10px; }}
-        .table-responsive {{ width: 100%; overflow-x: auto; }}
-        #dataTable {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-        #dataTable th, #dataTable td {{ padding: 15px; border-bottom: 1px solid var(--border-color); text-align: left; }}
-        .ai-planner-wrapper {{ display: flex; gap: 20px; margin-top: 20px; align-items: stretch; flex-wrap: wrap; }}
-        .ai-box {{ flex: 1.2; min-width: 350px; background: rgba(15, 23, 42, 0.8); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 12px; padding: 25px; }}
-        .planner-box {{ flex: 1; min-width: 300px; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 25px; }}
-        .planner-textarea {{ width: 100%; flex: 1; background: #0f172a; border: 1px dashed var(--border-color); color: var(--text-white); padding: 15px; border-radius: 8px; min-height: 250px; }}
     </style>
 </head>
 <body>
     <nav id="sidebar">
-        <div><h1 class="logo-title">VMP Analytics</h1><p style="font-size: 12px; color: var(--text-muted);">Hiệu suất Fanpage B2B</p></div>
-        <hr style="border: 0; border-top: 1px solid var(--border-color); width: 100%; margin: 15px 0;">
+        <h1 class="logo-title">VMP Analytics</h1>
+        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 20px;">Hiệu suất Fanpage B2B</p>
         <div class="menu-btn active">📊 Tổng quan</div>
-        <div class="menu-btn">🎯 Theo dõi Mục tiêu</div>
-        <div class="menu-btn">📝 Dữ liệu Content</div>
+        <div class="menu-btn">🎯 Mục tiêu</div>
+        <div class="menu-btn">📝 Content</div>
     </nav>
+
     <div id="main-content">
-        <div class="control-bar card">
+        <div class="control-bar">
             <div style="display:flex; gap:15px; align-items:center;">
-                <span>Bộ lọc:</span><input type="date" id="startDate"><input type="date" id="endDate">
+                <span style="font-weight:600; font-size:14px;">Bộ lọc: 01/04/2026 - 30/04/2026</span>
             </div>
             <div>
-                <button class="btn btn-html">💾 Lưu & Tải HTML</button>
+                <button class="btn btn-html" onclick="window.print()">💾 Lưu & Tải HTML</button>
                 <button class="btn btn-pdf">🖨 Xuất PDF</button>
             </div>
         </div>
-        <section id="section-tong-quan">
-            <div class="section-title">Tổng quan hiệu suất & Insight</div>
-            <div class="stats-grid" id="dynamicStats"></div>
-            <div class="card" style="margin-top: 25px;">
-                <h3>Xu hướng Reach 2025 - 2026</h3>
-                <div style="height: 350px;"><canvas id="reachChart"></canvas></div>
+
+        <div class="stats-grid" id="dynamicStats"></div>
+
+        <div class="card">
+            <h3 style="color:#fff; margin-top:0;">Xu hướng Reach 2025 - 2026</h3>
+            <div class="chart-container"><canvas id="reachChart"></canvas></div>
+        </div>
+
+        <div class="insight-grid">
+            <div class="card">
+                <h3 style="color:var(--accent-primary); font-size:16px;">💎 Định dạng (Format)</h3>
+                <div class="chart-container"><canvas id="formatChart"></canvas></div>
             </div>
-            <div class="insight-grid">
-                <div class="card"><h3>💎 Định dạng (Format)</h3><div class="chart-container"><canvas id="formatChart"></canvas></div></div>
-                <div class="card"><h3>🚀 Ma trận Content</h3><div class="chart-container"><canvas id="scatterChart"></canvas></div></div>
+            <div class="card" style="position:relative;">
+                <h3 style="color:var(--accent-warning); font-size:16px;">🚀 Ma trận Content</h3>
+                <div class="chart-container">
+                    <canvas id="scatterChart"></canvas>
+                    <div class="quadrant-label" style="top:10px; right:10px; color:var(--accent-success);">🌟 NGÔI SAO</div>
+                    <div class="quadrant-label" style="bottom:10px; left:10px; color:var(--accent-danger);">⚠️ YẾU</div>
+                </div>
             </div>
-        </section>
-        <section id="section-muc-tieu">
-            <div class="section-title">🎯 Theo dõi Mục tiêu 2026</div>
-            <div class="tracking-board">
-                <h3>Bảng 1: Theo dõi theo Tháng</h3>
-                <table class="tracking-table"><thead><tr><th>Tháng</th><th>2025</th><th>Mục tiêu</th><th>Thực đạt</th><th>Tiến độ</th></tr></thead><tbody id="table1-body"></tbody></table>
-            </div>
-        </section>
-        <section id="section-content">
-            <div class="section-title">📝 Dữ liệu Content</div>
-            <div class="card"><div class="table-responsive"><table id="dataTable"><thead><tr><th>Ngày</th><th>Nội dung</th><th>Reach</th><th>Tương tác</th></tr></thead><tbody id="tableBody"></tbody></table></div></div>
-        </section>
+        </div>
     </div>
+
     <script>
         const rawData = {json_payload};
         
         function parseNum(val) {{ return parseFloat(String(val).replace(/,/g, '')) || 0; }}
 
-        function updateSummaryStats() {{
-            const curAct = {{ r: 0, t: 0, c: 0, p: 0 }};
-            const pastAct = {{ r: 0, t: 0, c: 0, p: 0 }};
-            const targets = {{ r: 0, t: 0, c: 0, p: 0 }};
-
+        function initDashboard() {{
+            // 1. Render Stats
+            const stats = {{ r:0, t:0, c:0, p:0, pr:0, pt:0, pc:0, pp:0 }};
             rawData.raw_data.forEach(d => {{
                 const date = new Date(d['Created Time']);
                 if (date.getFullYear() === 2026 && date.getMonth() === 3) {{
-                    curAct.r += parseNum(d['Reach']);
-                    curAct.t += parseNum(d['Tổng tương tác']);
-                    curAct.c += parseNum(d['Clicks (Link)']);
-                    curAct.p += 1;
+                    stats.r += parseNum(d['Reach']); stats.t += parseNum(d['Tổng tương tác']);
+                    stats.c += parseNum(d['Clicks (Link)']); stats.p++;
                 }} else if (date.getFullYear() === 2025 && date.getMonth() === 3) {{
-                    pastAct.r += parseNum(d['Reach']);
-                    pastAct.t += parseNum(d['Tổng tương tác']);
-                    pastAct.c += parseNum(d['Clicks (Link)']);
-                    pastAct.p += 1;
+                    stats.pr += parseNum(d['Reach']); stats.pt += parseNum(d['Tổng tương tác']);
+                    stats.pc += parseNum(d['Clicks (Link)']); stats.pp++;
                 }}
             }});
 
-            const tData = rawData.tracking.data;
-            targets.r = tData['Reach'][3].tar26;
-            targets.t = tData['Tổng tương tác'][3].tar26;
-            targets.c = tData['Click link'][3].tar26;
-            targets.p = tData['Số lượng bài'][3].tar26;
+            const targets = {{ 
+                r: rawData.tracking.data['Reach'][3].tar26, 
+                t: rawData.tracking.data['Tổng tương tác'][3].tar26,
+                c: rawData.tracking.data['Click link'][3].tar26,
+                p: rawData.tracking.data['Số lượng bài'][3].tar26
+            }};
 
-            function buildCard(title, val, past, tar, color) {{
-                const pct = tar > 0 ? (val / tar * 100) : 0;
-                const diff = past > 0 ? ((val - past) / past * 100) : 0;
-                const trend = diff >= 0 ? 'up' : 'down';
-                const icon = diff >= 0 ? '↑' : '↓';
+            const buildStat = (title, val, past, tar, color) => {{
+                const pct = (val/tar*100).toFixed(1);
+                const diff = (((val-past)/past)*100).toFixed(1);
                 return `
                     <div class="stat-box" style="border-left-color:${{color}}">
                         <div class="stat-label">${{title}}</div>
                         <div class="stat-value">${{val.toLocaleString()}}</div>
-                        <div class="stat-compare"><span class="trend ${{trend}}">${{icon}} ${{Math.abs(diff).toFixed(1)}}%</span> vs cùng kỳ</div>
-                        <div class="stat-progress-label"><span>Mục tiêu: ${{tar.toLocaleString()}}</span><span>${{pct.toFixed(1)}}%</span></div>
-                        <div class="progress-container"><div class="progress-bar" style="width:${{Math.min(pct, 100)}}%; background:${{color}}"></div></div>
+                        <div class="trend ${{diff>=0?'up':'down'}}">${{diff>=0?'▲':'▼'}} ${{Math.abs(diff)}}% vs cùng kỳ</div>
+                        <div style="font-size:11px; margin-top:8px; display:flex; justify-content:space-between">
+                            <span>Mục tiêu: ${{tar.toLocaleString()}}</span><span>${{pct}}%</span>
+                        </div>
+                        <div class="progress-container"><div class="progress-bar" style="width:${{Math.min(pct,100)}}%; background:${{color}}"></div></div>
                     </div>`;
-            }}
+            }};
 
             document.getElementById('dynamicStats').innerHTML = 
-                buildCard('Tổng Reach', curAct.r, pastAct.r, targets.r, 'var(--accent-primary)') +
-                buildCard('Tương tác', curAct.t, pastAct.t, targets.t, 'var(--accent-success)') +
-                buildCard('Click link', curAct.c, pastAct.c, targets.c, 'var(--accent-purple)') +
-                buildCard('Số bài', curAct.p, pastAct.p, targets.p, 'var(--accent-warning)');
-        }}
+                buildStat('Tổng Reach', stats.r, stats.pr, targets.r, 'var(--accent-primary)') +
+                buildStat('Tương tác', stats.t, stats.pt, targets.t, 'var(--accent-success)') +
+                buildStat('Click Link', stats.c, stats.pc, targets.c, 'var(--accent-purple)') +
+                buildStat('Số Bài', stats.p, stats.pp, targets.p, 'var(--accent-warning)');
 
-        function renderReachChart() {{
-            const ctx = document.getElementById('reachChart').getContext('2d');
-            const months = [1,2,3,4,5,6,7,8,9,10,11,12];
-            const datasets = [];
-            const colors = ['#38bdf8', '#10b981'];
-            let i = 0;
-            for (const year in rawData.reach_trend) {{
-                datasets.push({{
-                    label: 'Năm ' + year, data: months.map(m => rawData.reach_trend[year][m] || 0),
-                    borderColor: colors[i++ % 2], tension: 0.3
-                }});
-            }}
-            new Chart(ctx, {{ type: 'line', data: {{ labels: months.map(m => 'T'+m), datasets }}, options: {{ responsive: true, maintainAspectRatio: false }} }});
-        }}
+            // 2. Reach Chart
+            new Chart(document.getElementById('reachChart'), {{
+                type: 'line',
+                data: {{
+                    labels: ['T1','T2','T3','T4','T5','T6','T7','T8','T9','T10','T11','T12'],
+                    datasets: [
+                        {{ label: '2026', data: Object.values(rawData.reach_trend[2026] || {{}}), borderColor: '#10b981', tension: 0.3 }},
+                        {{ label: '2025', data: Object.values(rawData.reach_trend[2025] || {{}}), borderColor: '#38bdf8', tension: 0.3 }}
+                    ]
+                }},
+                options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ labels: {{ color: '#fff' }} }} }} }}
+            }});
 
-        window.onload = () => {{
-            updateSummaryStats();
-            renderReachChart();
-            // Khởi tạo các phần khác tương tự...
-        }};
+            // 3. Format Chart (FIX)
+            const fmtMap = {{}};
+            rawData.raw_data.filter(d => new Date(d['Created Time']).getFullYear() === 2026).forEach(d => {{
+                const f = d['FORMAT'] || 'Khác';
+                if (!fmtMap[f]) fmtMap[f] = {{ r: 0, i: 0, c: 0 }};
+                fmtMap[f].r += parseNum(d['Reach']); fmtMap[f].i += parseNum(d['Tổng tương tác']); fmtMap[f].c++;
+            }});
+            const fmtLabels = Object.keys(fmtMap);
+            new Chart(document.getElementById('formatChart'), {{
+                type: 'bar',
+                data: {{
+                    labels: fmtLabels,
+                    datasets: [
+                        {{ label: 'Reach TB', data: fmtLabels.map(l => fmtMap[l].r/fmtMap[l].c), backgroundColor: '#38bdf8', yAxisID: 'y' }},
+                        {{ label: 'Tương tác (%)', data: fmtLabels.map(l => (fmtMap[l].i/fmtMap[l].r*100)), type: 'line', borderColor: '#fbbf24', yAxisID: 'y1' }}
+                    ]
+                }},
+                options: {{ 
+                    responsive: true, maintainAspectRatio: false,
+                    scales: {{ 
+                        y: {{ ticks: {{ color: '#fff' }} }},
+                        y1: {{ position: 'right', ticks: {{ color: '#fbbf24' }} }}
+                    }}
+                }}
+            }});
+
+            // 4. Matrix Chart (FIX)
+            const matrixPoints = rawData.raw_data.filter(d => new Date(d['Created Time']).getFullYear() === 2026).slice(0,50).map(d => ({{
+                x: parseNum(d['Reach']), y: (parseNum(d['Tổng tương tác'])/parseNum(d['Reach'])*100) || 0
+            }}));
+            new Chart(document.getElementById('scatterChart'), {{
+                type: 'scatter',
+                data: {{ datasets: [{{ label: 'Content', data: matrixPoints, backgroundColor: '#38bdf8' }}] }},
+                options: {{ 
+                    responsive: true, maintainAspectRatio: false,
+                    scales: {{ x: {{ ticks: {{ color: '#fff' }} }}, y: {{ ticks: {{ color: '#fff' }} }} }}
+                }}
+            }});
+        }}
+        
+        initDashboard();
     </script>
 </body>
 </html>
 """
 
-# NHÚNG VÀO APP
-components.html(html_content, height=1200, scrolling=True)
+components.html(html_full_code, height=1500, scrolling=True)
